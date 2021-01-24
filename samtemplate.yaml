@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: EventBridge integration with Firehose
+Parameters:
+  PartnerEventSource:
+    Description: Name of Partner Event Source
+    Type: String
+    Default: "aws.partner/freshworks.com/1342406/freshdesk"
+  S3BucketName:
+    Description: Name of s3 bucket where Freshdesk ticket events are stored
+    Type: String
+    Default: "frshdeskv1"
+
+Resources:
+  FreshdeskS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref "AWS::AccountId"
+
+  FirehoseDeliveryPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: firehose_delivery_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "s3:AbortMultipartUpload"
+              - "s3:GetBucketLocation"
+              - "s3:GetObject"
+              - "s3:ListBucket"
+              - "s3:ListBucketMultipartUploads"
+              - "s3:PutObject"
+            Resource:
+              - !Sub "arn:aws:s3:::${FreshdeskS3Bucket}"
+              - !Sub "arn:aws:s3:::${FreshdeskS3Bucket}/*"
+      Roles:
+        - !Ref FirehoseDeliveryRole
+
+  InvokeProcessorLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: firehose_processor_lambda_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "lambda:InvokeFunction"
+            Resource:
+              - !GetAtt FirehoseProcessorLambda.Arn
+      Roles:
+        - !Ref FirehoseDeliveryRole
+
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub "arn:aws:s3:::${FreshdeskS3Bucket}"
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 50
+        CompressionFormat: UNCOMPRESSED
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt FirehoseProcessorLambda.Arn
+              Type: Lambda
+
+  FirehoseProcessorLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdaprocessor/
+      Handler: index.handler
+      Runtime: nodejs12.x
+      FunctionName: freshdesk-data-processor
+
+  FreshDeskPartnerEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      EventSourceName: !Ref PartnerEventSource
+      Name: !Ref PartnerEventSource
+
+  PushToFirehoseRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: Test Freshdesk Events Rule
+      EventBusName: !Ref PartnerEventSource
+      EventPattern:
+        account: [!Ref AWS::AccountId]
+      Name: freshdeskeventrule
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::GetAtt:
+              - "FirehoseDeliveryStream"
+              - "Arn"
+          Id: "idfreshdeskeventrule"
+          RoleArn: !GetAtt EventRuleTargetIamRole.Arn
+
+  EventRuleTargetIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: Invoke_Firehose
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "firehose:PutRecord"
+                  - "firehose:PutRecordBatch"
+                Resource:
+                  - !GetAtt FirehoseDeliveryStream.Arn
